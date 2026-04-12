@@ -166,33 +166,73 @@ const decodeHtml = (text) => {
   return doc.body.textContent || "";
 };
 
-const fetchTranscript = async (videoId) => {
-  for (const lang of ["ja", "en"]) {
-    const endpoint = `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}`;
+const CORS_PROXY_PREFIXES = [
+  "",
+  "https://cors.isomorphic-git.org/",
+  "https://api.allorigins.win/raw?url=",
+];
+
+const fetchTextWithCorsFallback = async (url) => {
+  for (const prefix of CORS_PROXY_PREFIXES) {
+    const endpoint = prefix ? `${prefix}${encodeURIComponent(url)}` : url;
     try {
       const response = await fetch(endpoint);
       if (!response.ok) continue;
-      const xmlText = await response.text();
-      if (!xmlText.includes("<text")) continue;
-
-      const xml = new DOMParser().parseFromString(xmlText, "application/xml");
-      const nodes = [...xml.querySelectorAll("text")];
-      if (!nodes.length) continue;
-
-      return nodes
-        .map((node) => {
-          const sec = Number(node.getAttribute("start") || "0").toFixed(2);
-          const line = decodeHtml(node.textContent || "").trim();
-          return line ? `- [${sec}s] ${line}` : "";
-        })
-        .filter(Boolean)
-        .join("\n");
+      return await response.text();
     } catch {
-      // ignore and try next language
+      // ignore and try next endpoint
     }
   }
+  return "";
+};
 
-  return "字幕を取得できませんでした（CORSまたは字幕未公開の可能性があります）。";
+const fetchTranscript = async (videoId) => {
+  for (const lang of ["ja", "en", "ja-JP", "en-US"]) {
+    const endpoint = `https://www.youtube.com/api/timedtext?lang=${lang}&v=${videoId}`;
+    const xmlText = await fetchTextWithCorsFallback(endpoint);
+    if (!xmlText.includes("<text")) continue;
+
+    const xml = new DOMParser().parseFromString(xmlText, "application/xml");
+    const nodes = [...xml.querySelectorAll("text")];
+    if (!nodes.length) continue;
+
+    return nodes
+      .map((node) => {
+        const sec = Number(node.getAttribute("start") || "0").toFixed(2);
+        const line = decodeHtml(node.textContent || "").trim();
+        return line ? `- [${sec}s] ${line}` : "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // 自動生成字幕（kind=asr）も試す
+  for (const lang of ["ja", "en", "ja-JP", "en-US"]) {
+    const endpoint = `https://www.youtube.com/api/timedtext?lang=${lang}&kind=asr&v=${videoId}`;
+    const xmlText = await fetchTextWithCorsFallback(endpoint);
+    if (!xmlText.includes("<text")) continue;
+
+    const xml = new DOMParser().parseFromString(xmlText, "application/xml");
+    const nodes = [...xml.querySelectorAll("text")];
+    if (!nodes.length) continue;
+
+    return nodes
+      .map((node) => {
+        const sec = Number(node.getAttribute("start") || "0").toFixed(2);
+        const line = decodeHtml(node.textContent || "").trim();
+        return line ? `- [${sec}s] ${line}` : "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return [
+    "字幕を取得できませんでした。",
+    "- YouTube 側の字幕未公開/無効化",
+    "- ブラウザの CORS 制限",
+    "- CORS プロキシの一時的な障害",
+    "が原因の可能性があります。",
+  ].join("\n");
 };
 
 const convertYoutube = async () => {

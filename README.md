@@ -59,7 +59,8 @@ python main.py youtube <YouTube URL>
 ### YouTube変換（WASM版）
 
 - oEmbed API でタイトル/チャンネル情報を取得
-- 字幕API (`timedtext`) を `ja` → `en` の順で取得を試行
+- 字幕API (`timedtext`) を `ja` / `en`（手動・自動生成）で取得を試行
+- CORS 制限に備えて、直接取得に失敗した場合は CORS プロキシ経由で再試行
 - 字幕が取れない場合は理由メッセージをMarkdownに出力
 
 ### ローカル確認
