@@ -86,7 +86,7 @@ const convertFile = async () => {
   pyodide.globals.set("input_path", tmpPath);
   pyodide.globals.set("input_ext", ext);
 
-  const result = await pyodide.runPythonAsync(`
+  const result = await pyodide.runPythonAsync(String.raw`
 from pathlib import Path
 import csv
 import json
@@ -112,13 +112,13 @@ def to_md_table(rows):
 
     lines = [row_to_line(header), row_to_line(sep)]
     lines += [row_to_line(r) for r in body]
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 if ext in {".txt", ".md"}:
     output = raw.decode("utf-8", errors="replace")
 elif ext == ".json":
     data = json.loads(raw.decode("utf-8", errors="replace"))
-    output = "~~~json\n" + json.dumps(data, ensure_ascii=False, indent=2) + "\n~~~"
+    output = "~~~json\\n" + json.dumps(data, ensure_ascii=False, indent=2) + "\\n~~~"
 elif ext in {".csv", ".tsv"}:
     delimiter = "\t" if ext == ".tsv" else ","
     text = raw.decode("utf-8", errors="replace")
@@ -139,7 +139,7 @@ elif ext in {".html", ".htm"}:
 
     parser = Extractor()
     parser.feed(text)
-    output = "\n\n".join(parser.parts)
+    output = "\\n\\n".join(parser.parts)
 else:
     raise ValueError(
         "WASM版で未対応の拡張子です。対応: txt, md, json, csv, tsv, html, htm"
