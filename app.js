@@ -89,8 +89,11 @@ const convertFile = async () => {
   const result = await pyodide.runPythonAsync(String.raw`
 from pathlib import Path
 import csv
+import io
 import json
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
 path = Path(input_path)
@@ -113,6 +116,90 @@ def to_md_table(rows):
     lines = [row_to_line(header), row_to_line(sep)]
     lines += [row_to_line(r) for r in body]
     return "\\n".join(lines)
+
+def col_to_index(col):
+    value = 0
+    for ch in col:
+        value = value * 26 + (ord(ch) - ord("A") + 1)
+    return value - 1
+
+def parse_xlsx_bytes(data):
+    ns_main = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    ns_rel = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        shared_strings = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            shared_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in shared_root.findall("x:si", ns_main):
+                parts = [t.text or "" for t in si.findall(".//x:t", ns_main)]
+                shared_strings.append("".join(parts))
+
+        workbook_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        rel_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {
+            rel.get("Id"): rel.get("Target")
+            for rel in rel_root.findall("r:Relationship", ns_rel)
+        }
+
+        sheets = []
+        for sheet in workbook_root.findall("x:sheets/x:sheet", ns_main):
+            name = sheet.get("name") or "Sheet"
+            rid = sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            target = rel_map.get(rid, "")
+            if not target:
+                continue
+            sheet_path = f"xl/{target}" if not target.startswith("xl/") else target
+            if sheet_path.startswith("xl//"):
+                sheet_path = sheet_path.replace("xl//", "xl/", 1)
+            sheets.append((name, sheet_path))
+
+        md_sections = []
+        for name, sheet_path in sheets:
+            if sheet_path not in zf.namelist():
+                continue
+
+            sheet_root = ET.fromstring(zf.read(sheet_path))
+            rows = []
+            for row in sheet_root.findall(".//x:sheetData/x:row", ns_main):
+                cells = {}
+                max_idx = -1
+                for cell in row.findall("x:c", ns_main):
+                    ref = cell.get("r", "")
+                    match = re.match(r"([A-Z]+)", ref)
+                    idx = col_to_index(match.group(1)) if match else (max_idx + 1)
+                    max_idx = max(max_idx, idx)
+
+                    cell_type = cell.get("t")
+                    val_node = cell.find("x:v", ns_main)
+                    inline_node = cell.find("x:is/x:t", ns_main)
+
+                    value = ""
+                    if cell_type == "s" and val_node is not None and val_node.text:
+                        try:
+                            value = shared_strings[int(val_node.text)]
+                        except Exception:
+                            value = val_node.text
+                    elif inline_node is not None and inline_node.text is not None:
+                        value = inline_node.text
+                    elif val_node is not None and val_node.text is not None:
+                        value = val_node.text
+
+                    cells[idx] = value
+
+                if max_idx >= 0:
+                    row_values = [cells.get(i, "") for i in range(max_idx + 1)]
+                    rows.append(row_values)
+
+            if not rows:
+                continue
+
+            md_sections.append(f"## {name}\n\n{to_md_table(rows)}")
+
+    if not md_sections:
+        return ""
+
+    return "\n\n".join(md_sections)
 
 if ext in {".txt", ".md"}:
     output = raw.decode("utf-8", errors="replace")
@@ -140,9 +227,11 @@ elif ext in {".html", ".htm"}:
     parser = Extractor()
     parser.feed(text)
     output = "\\n\\n".join(parser.parts)
+elif ext == ".xlsx":
+    output = parse_xlsx_bytes(raw)
 else:
     raise ValueError(
-        "WASM版で未対応の拡張子です。対応: txt, md, json, csv, tsv, html, htm"
+        "WASM版で未対応の拡張子です。対応: txt, md, json, csv, tsv, html, htm, xlsx"
     )
 
 output

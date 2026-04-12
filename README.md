@@ -55,6 +55,7 @@ python main.py youtube <YouTube URL>
 - `.csv`
 - `.tsv`
 - `.html` / `.htm`
+- `.xlsx`（先頭行をヘッダとしてシートごとにMarkdown表へ変換）
 
 ### YouTube変換（WASM版）
 
