@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MarkItDown Web (WASM)</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>MarkItDown Web (WASM)</h1>
+      <p class="lead">
+        ローカルファイルまたは YouTube URL を Markdown に変換し、出力先を確認してダウンロードできます。
+      </p>
+
+      <section class="card">
+        <h2>1. 入力方法</h2>
+        <div class="row">
+          <label><input type="radio" name="mode" value="file" checked /> ファイル選択</label>
+          <label><input type="radio" name="mode" value="youtube" /> YouTube URL</label>
+        </div>
+
+        <div id="file-input-wrap" class="input-wrap">
+          <input id="file-input" type="file" />
+        </div>
+
+        <div id="youtube-input-wrap" class="input-wrap hidden">
+          <input id="youtube-url" type="url" placeholder="https://www.youtube.com/watch?v=..." />
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>2. 出力先確認</h2>
+        <label for="output-name">出力ファイル名</label>
+        <input id="output-name" type="text" placeholder="output.md" />
+        <p id="output-preview" class="preview">出力先: Downloads/output.md</p>
+      </section>
+
+      <section class="card">
+        <h2>3. 変換して出力</h2>
+        <button id="convert-btn">変換してダウンロード</button>
+        <p id="status" class="status">Pyodide を初期化中です...</p>
+      </section>
+
+      <section class="card">
+        <h2>プレビュー</h2>
+        <textarea id="preview-text" rows="16" readonly></textarea>
+      </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
