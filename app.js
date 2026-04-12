@@ -16,6 +16,13 @@ const sanitizeFileName = (name) => {
   return sanitized || "output";
 };
 
+const YOUTUBE_TITLE_MAX_LENGTH = 30;
+
+const buildYoutubeOutputName = (title) => {
+  const safeTitle = sanitizeFileName(title || "youtube").slice(0, YOUTUBE_TITLE_MAX_LENGTH);
+  return `${safeTitle}.md`;
+};
+
 const setStatus = (message) => {
   statusEl.textContent = message;
 };
@@ -166,15 +173,17 @@ const decodeHtml = (text) => {
   return doc.body.textContent || "";
 };
 
-const CORS_PROXY_PREFIXES = [
-  "",
-  "https://cors.isomorphic-git.org/",
-  "https://api.allorigins.win/raw?url=",
+const CORS_FETCH_TARGETS = [
+  { prefix: "", encodeUrl: false },
+  { prefix: "https://cors.isomorphic-git.org/", encodeUrl: false },
+  { prefix: "https://api.allorigins.win/raw?url=", encodeUrl: true },
 ];
 
 const fetchTextWithCorsFallback = async (url) => {
-  for (const prefix of CORS_PROXY_PREFIXES) {
-    const endpoint = prefix ? `${prefix}${encodeURIComponent(url)}` : url;
+  for (const target of CORS_FETCH_TARGETS) {
+    const endpoint = target.prefix
+      ? `${target.prefix}${target.encodeUrl ? encodeURIComponent(url) : url}`
+      : url;
     try {
       const response = await fetch(endpoint);
       if (!response.ok) continue;
@@ -255,8 +264,9 @@ const convertYoutube = async () => {
   const meta = await metaRes.json();
   const transcriptMd = await fetchTranscript(videoId);
 
-  return [
-    `# ${meta.title || "YouTube Video"}`,
+  const title = meta.title || "YouTube Video";
+  const markdown = [
+    `# ${title}`,
     "",
     `- URL: ${url}`,
     `- チャンネル: ${meta.author_name || "不明"}`,
@@ -264,6 +274,11 @@ const convertYoutube = async () => {
     "## Transcript",
     transcriptMd,
   ].join("\n");
+
+  return {
+    markdown,
+    suggestedOutputName: buildYoutubeOutputName(title),
+  };
 };
 
 const onConvert = async () => {
@@ -273,14 +288,28 @@ const onConvert = async () => {
   }
 
   const mode = selectedMode();
-  const outputName = (outputNameEl.value || defaultOutputName()).trim();
+  const enteredOutputName = (outputNameEl.value || "").trim();
   setStatus("変換中...");
   convertBtn.disabled = true;
 
   try {
-    const markdown = mode === "file" ? await convertFile() : await convertYoutube();
+    let markdown = "";
+    let outputName = enteredOutputName || defaultOutputName();
+
+    if (mode === "file") {
+      markdown = await convertFile();
+    } else {
+      const result = await convertYoutube();
+      markdown = result.markdown;
+      if (!enteredOutputName || enteredOutputName === "youtube.md") {
+        outputName = result.suggestedOutputName;
+        outputNameEl.value = outputName;
+      }
+    }
+
     previewEl.value = markdown;
     writeDownload(outputName, markdown);
+    refreshOutputPreview();
     setStatus(`変換完了: Downloads/${outputName} に保存しました。`);
   } catch (error) {
     setStatus(`エラー: ${error?.message ?? String(error)}`);
