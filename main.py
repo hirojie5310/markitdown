@@ -1,21 +1,231 @@
 import argparse
+import importlib
+import importlib.util
 import re
 from pathlib import Path
+from typing import Any, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
 from markitdown import MarkItDown
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 
-
 DEFAULT_OUTPUT_DIR = "output"
 YOUTUBE_TITLE_MAX_LENGTH = 30
 TRANSCRIPT_LANGUAGES = ["ja", "en"]
+VERTICAL_LINE_JOIN_THRESHOLD = 0.7
+VERTICAL_PDF_COLUMN_TOLERANCE_RATIO = 0.45
+VERTICAL_RUBY_FONT_SIZE_RATIO = 0.78
+PUNCTUATION_ONLY_RE = re.compile(r"^[\s、。，．・：；！？,.]+$")
+
+
+class PdfChar(TypedDict):
+    """PDFから取得した1文字分の座標情報。"""
+
+    text: str
+    x: float
+    y: float
+    size: float
+
+
+class VerticalPdfColumn(TypedDict):
+    """縦書きPDFの1列分のテキストと座標情報。"""
+
+    x: float
+    text: str
+    median_size: float
+
+
+class VerticalPdfColumnBuilder(TypedDict):
+    """列クラスタリング中に使う作業用データ。"""
+
+    x: float
+    chars: list[PdfChar]
 
 
 def ensure_output_dir(output_dir: Path) -> None:
     """出力先ディレクトリが存在しない場合は作成する。"""
     output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _median(values: list[float]) -> float:
+    """数値リストの中央値を返す。"""
+    sorted_values = sorted(values)
+    midpoint = len(sorted_values) // 2
+
+    if len(sorted_values) % 2:
+        return sorted_values[midpoint]
+
+    return (sorted_values[midpoint - 1] + sorted_values[midpoint]) / 2
+
+
+def _cluster_vertical_pdf_chars(
+    chars: list[PdfChar],
+) -> list[VerticalPdfColumn]:
+    """PDF文字座標を縦書きの列ごとにまとめ、右から左の読順で返す。"""
+    if not chars:
+        return []
+
+    base_size = _median([char["size"] for char in chars])
+    x_tolerance = max(2.5, base_size * VERTICAL_PDF_COLUMN_TOLERANCE_RATIO)
+    columns: list[VerticalPdfColumnBuilder] = []
+
+    for char in sorted(chars, key=lambda item: item["x"], reverse=True):
+        matching_column = None
+        for column in columns:
+            if abs(column["x"] - char["x"]) <= x_tolerance:
+                matching_column = column
+                break
+
+        if matching_column is None:
+            columns.append({"x": char["x"], "chars": [char]})
+            continue
+
+        column_chars = matching_column["chars"]
+        column_chars.append(char)
+        matching_column["x"] = sum(item["x"] for item in column_chars) / len(
+            column_chars
+        )
+
+    formatted_columns: list[VerticalPdfColumn] = []
+    for column in columns:
+        column_chars = column["chars"]
+        sorted_chars = sorted(column_chars, key=lambda item: item["y"])
+        text = "".join(char["text"].strip() for char in sorted_chars).strip()
+        if not text:
+            continue
+        if len(text) <= 5 and PUNCTUATION_ONLY_RE.fullmatch(text):
+            continue
+
+        sizes = [char["size"] for char in sorted_chars]
+        formatted_columns.append(
+            {
+                "x": column["x"],
+                "text": text,
+                "median_size": _median(sizes),
+            }
+        )
+
+    return sorted(formatted_columns, key=lambda item: item["x"], reverse=True)
+
+
+def _format_vertical_pdf_columns(
+    chars: list[PdfChar],
+) -> list[str]:
+    """縦書きPDFの文字座標から、右から左へ本文行を組み立てる。"""
+    columns = _cluster_vertical_pdf_chars(chars)
+    if not columns:
+        return []
+
+    base_size = _median([column["median_size"] for column in columns])
+    ruby_threshold = base_size * VERTICAL_RUBY_FONT_SIZE_RATIO
+    pending_ruby: list[str] = []
+    lines: list[str] = []
+
+    for column in columns:
+        text = column["text"]
+        is_ruby = column["median_size"] < ruby_threshold and len(text) <= 30
+
+        if is_ruby:
+            pending_ruby.append(text)
+            continue
+
+        if pending_ruby:
+            ruby_text = "".join(pending_ruby)
+            if len(text) <= 12:
+                text = f"{text}{ruby_text}"
+            else:
+                text = f"{text}（{ruby_text}）"
+            pending_ruby = []
+
+        lines.append(text)
+
+    if pending_ruby and lines:
+        lines[-1] = f"{lines[-1]}（{''.join(pending_ruby)}）"
+
+    return lines
+
+
+def extract_vertical_pdf_text(input_file: Path) -> str:
+    """
+    PDFの文字座標を使い、縦書き本文を右から左の読順で抽出する。
+
+    MarkItDown経由の抽出では縦書き列の順序が崩れることがあるため、PDFの場合は
+    文字座標を列にクラスタリングしてから本文を組み立てる。
+    """
+    if importlib.util.find_spec("fitz") is None:
+        return ""
+
+    fitz = importlib.import_module("fitz")
+
+    page_texts: list[str] = []
+    with fitz.open(input_file) as doc:
+        for page in doc:
+            chars: list[PdfChar] = []
+            raw_page = cast(dict[str, Any], page.get_text("rawdict"))
+            for block in raw_page.get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        size = float(span.get("size", 0.0))
+                        for char in span.get("chars", []):
+                            text = str(char.get("c", "")).strip()
+                            if not text:
+                                continue
+
+                            x0, y0, x1, y1 = char.get("bbox", (0, 0, 0, 0))
+                            chars.append(
+                                {
+                                    "text": text,
+                                    "x": (float(x0) + float(x1)) / 2,
+                                    "y": (float(y0) + float(y1)) / 2,
+                                    "size": size,
+                                }
+                            )
+
+            lines = _format_vertical_pdf_columns(chars)
+            if lines:
+                page_texts.append("\n".join(lines))
+
+    return "\n\n".join(page_texts)
+
+
+def _is_probable_vertical_text_block(lines: list[str]) -> bool:
+    """1文字ごとに改行された縦書き抽出結果らしいブロックか判定する。"""
+    stripped_lines = [line.strip() for line in lines if line.strip()]
+
+    if len(stripped_lines) < 3:
+        return False
+
+    short_line_count = sum(1 for line in stripped_lines if len(line) <= 2)
+    short_line_ratio = short_line_count / len(stripped_lines)
+
+    return short_line_ratio >= VERTICAL_LINE_JOIN_THRESHOLD
+
+
+def join_vertical_text_lines(content: str) -> str:
+    """
+    縦書きPDFなどで1文字ごとに改行された本文を、段落単位で連結する。
+
+    空行で区切られたブロックの大半が1〜2文字の行で構成されている場合のみ
+    連結するため、通常の横書きMarkdownや箇条書きへの影響を抑える。
+    """
+    parts = re.split(r"(\n[ \t]*\n+)", content)
+    normalized_parts: list[str] = []
+
+    for part in parts:
+        if not part or re.fullmatch(r"\n[ \t]*\n+", part):
+            normalized_parts.append(part)
+            continue
+
+        lines = part.splitlines()
+        if _is_probable_vertical_text_block(lines):
+            normalized_parts.append(
+                "".join(line.strip() for line in lines if line.strip())
+            )
+        else:
+            normalized_parts.append(part)
+
+    return "".join(normalized_parts)
 
 
 def save_markdown(content: str, output_path: Path) -> None:
@@ -60,6 +270,7 @@ def convert_file_to_markdown(
     input_path: str,
     output_dir: str = DEFAULT_OUTPUT_DIR,
     output_file: str | None = None,
+    join_vertical_lines: bool = False,
 ) -> None:
     """
     PDF、Excel、WordなどのローカルファイルをMarkdownに変換する。
@@ -69,8 +280,16 @@ def convert_file_to_markdown(
     if not input_file.exists():
         raise FileNotFoundError(f"入力ファイルが見つかりません: {input_file}")
 
-    md = MarkItDown()
-    result = md.convert(str(input_file))
+    text_content = ""
+    if join_vertical_lines and input_file.suffix.lower() == ".pdf":
+        text_content = extract_vertical_pdf_text(input_file)
+
+    if not text_content:
+        md = MarkItDown()
+        result = md.convert(str(input_file))
+        text_content = result.text_content
+        if join_vertical_lines:
+            text_content = join_vertical_text_lines(text_content)
 
     base_name = input_file.stem
     output_path = build_output_path(
@@ -79,7 +298,7 @@ def convert_file_to_markdown(
         output_file=output_file,
     )
 
-    save_markdown(result.text_content, output_path)
+    save_markdown(text_content, output_path)
 
 
 def extract_video_id(url: str) -> str:
@@ -213,6 +432,11 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="出力ファイル名（例: result.md）",
     )
+    parser_file.add_argument(
+        "--join-vertical-lines",
+        action="store_true",
+        help="縦書きPDFの列順を右から左へ整え、1文字ごとに改行された本文も段落単位で連結",
+    )
 
     # youtube モード
     parser_youtube = subparsers.add_parser(
@@ -248,6 +472,7 @@ def main() -> None:
             input_path=args.input,
             output_dir=args.output_dir,
             output_file=args.output_file,
+            join_vertical_lines=args.join_vertical_lines,
         )
         return
 

@@ -1,2 +1,3 @@
 markitdown
 youtube-transcript-api
+pymupdf

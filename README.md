@@ -29,6 +29,15 @@ python main.py file <入力ファイルパス>
 python main.py youtube <YouTube URL>
 ```
 
+縦書きの書籍をスキャンしたPDFなどで、OCR結果が1文字ごとに改行されたり、
+本文の列順が崩れたりする場合は、`--join-vertical-lines` を付けます。
+PDFでは文字座標を使って縦書き列を右から左へ並べ替え、座標抽出が使えない場合は
+空行で区切られた段落単位で本文を連結します。
+
+```bash
+python main.py file <入力PDFパス> --join-vertical-lines
+```
+
 ---
 
 ## 2. GitHub Pages（WASM）版
