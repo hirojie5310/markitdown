@@ -1,7 +1,11 @@
 import argparse
 import importlib
 import importlib.util
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
@@ -17,6 +21,10 @@ VERTICAL_LINE_JOIN_THRESHOLD = 0.7
 VERTICAL_PDF_COLUMN_TOLERANCE_RATIO = 0.45
 VERTICAL_RUBY_FONT_SIZE_RATIO = 0.78
 PUNCTUATION_ONLY_RE = re.compile(r"^[\s、。，．・：；！？,.]+$")
+OCR_LANGUAGES = "jpn_vert+jpn+eng"
+PADDLEOCR_RENDER_SCALE = 2.5
+PADDLEOCR_SCORE_THRESHOLD = 0.5
+PADDLEX_CACHE_DIR = Path(__file__).resolve().parent / ".paddlex_cache"
 
 
 class PdfChar(TypedDict):
@@ -41,6 +49,16 @@ class VerticalPdfColumnBuilder(TypedDict):
 
     x: float
     chars: list[PdfChar]
+
+
+class OcrLine(TypedDict):
+    """OCRで認識した1行分のテキストと座標情報。"""
+
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
 
 
 def ensure_output_dir(output_dir: Path) -> None:
@@ -189,6 +207,206 @@ def extract_vertical_pdf_text(input_file: Path) -> str:
     return "\n\n".join(page_texts)
 
 
+def count_pdf_text_chars(input_file: Path) -> int | None:
+    """PDF内の文字数を返す。PyMuPDF未導入時は None を返す。"""
+    if importlib.util.find_spec("fitz") is None:
+        return None
+
+    fitz = importlib.import_module("fitz")
+
+    total_chars = 0
+    with fitz.open(input_file) as doc:
+        for page in doc:
+            raw_page = cast(dict[str, Any], page.get_text("rawdict"))
+            for block in raw_page.get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        total_chars += len(span.get("chars", []))
+
+    return total_chars
+
+
+def _set_paddleocr_cache_env() -> None:
+    """PaddleOCR/PaddleX のキャッシュ先をワークスペース配下に固定する。"""
+    PADDLEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(PADDLEX_CACHE_DIR))
+
+
+def _normalize_ocr_text(text: str) -> str:
+    """OCRで拾った前後空白を詰める。"""
+    return re.sub(r"\s+", "", text).strip()
+
+
+def _extract_paddleocr_lines_from_result(result: Any) -> list[OcrLine]:
+    """PaddleOCR の推論結果からテキスト行を取り出す。"""
+    lines: list[OcrLine] = []
+    texts = result.get("rec_texts", [])
+    scores = result.get("rec_scores", [])
+    polys = result.get("rec_polys", [])
+
+    for text, score, poly in zip(texts, scores, polys):
+        normalized_text = _normalize_ocr_text(str(text))
+        if not normalized_text or float(score) < PADDLEOCR_SCORE_THRESHOLD:
+            continue
+        if len(normalized_text) <= 5 and PUNCTUATION_ONLY_RE.fullmatch(normalized_text):
+            continue
+
+        xs = [float(point[0]) for point in poly]
+        ys = [float(point[1]) for point in poly]
+        lines.append(
+            {
+                "text": normalized_text,
+                "x": sum(xs) / len(xs),
+                "y": sum(ys) / len(ys),
+                "width": max(xs) - min(xs),
+                "height": max(ys) - min(ys),
+            }
+        )
+
+    return lines
+
+
+def _cluster_vertical_ocr_lines(lines: list[OcrLine]) -> list[list[OcrLine]]:
+    """OCR行を縦書きの列ごとにまとめる。"""
+    if not lines:
+        return []
+
+    widths = [max(1.0, line["width"]) for line in lines]
+    x_tolerance = max(18.0, _median(widths) * 0.9)
+    columns: list[list[OcrLine]] = []
+    column_centers: list[float] = []
+
+    for line in sorted(lines, key=lambda item: item["x"], reverse=True):
+        matched_index = None
+        for index, center in enumerate(column_centers):
+            if abs(center - line["x"]) <= x_tolerance:
+                matched_index = index
+                break
+
+        if matched_index is None:
+            columns.append([line])
+            column_centers.append(line["x"])
+            continue
+
+        columns[matched_index].append(line)
+        column_centers[matched_index] = sum(
+            item["x"] for item in columns[matched_index]
+        ) / len(columns[matched_index])
+
+    ordered_columns = [
+        sorted(column, key=lambda item: item["y"]) for column in columns
+    ]
+    return [
+        column
+        for _, column in sorted(
+            zip(column_centers, ordered_columns), key=lambda item: item[0], reverse=True
+        )
+    ]
+
+
+def _format_vertical_ocr_lines(lines: list[OcrLine]) -> list[str]:
+    """縦書きOCR結果を右から左の読順に整える。"""
+    columns = _cluster_vertical_ocr_lines(lines)
+    return ["".join(line["text"] for line in column) for column in columns if column]
+
+
+def extract_paddleocr_pdf_text(
+    input_file: Path,
+    join_vertical_lines: bool = False,
+) -> str:
+    """PaddleOCR でPDF画像をOCRし、ページごとの本文を返す。"""
+    if importlib.util.find_spec("fitz") is None:
+        raise RuntimeError(
+            "PaddleOCR でPDFを処理するには `pymupdf` が必要です。"
+        )
+    if importlib.util.find_spec("paddleocr") is None:
+        raise RuntimeError(
+            "PaddleOCR が見つかりません。macOS ではまず "
+            "`python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/` "
+            "と `python -m pip install paddleocr` を実行してください。"
+        )
+
+    _set_paddleocr_cache_env()
+
+    fitz = importlib.import_module("fitz")
+    paddleocr_module = importlib.import_module("paddleocr")
+    PaddleOCR = getattr(paddleocr_module, "PaddleOCR")
+    ocr = PaddleOCR(
+        lang="japan",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+
+    page_texts: list[str] = []
+    with fitz.open(input_file) as doc:
+        for page in doc:
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(PADDLEOCR_RENDER_SCALE, PADDLEOCR_RENDER_SCALE),
+                alpha=False,
+            )
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+            try:
+                pixmap.save(temp_path)
+                results = list(ocr.predict(str(temp_path)))
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+            if not results:
+                continue
+
+            lines = _extract_paddleocr_lines_from_result(results[0])
+            if not lines:
+                continue
+
+            if join_vertical_lines:
+                formatted_lines = _format_vertical_ocr_lines(lines)
+            else:
+                formatted_lines = [
+                    line["text"] for line in sorted(lines, key=lambda item: (item["y"], item["x"]))
+                ]
+
+            if formatted_lines:
+                page_texts.append("\n".join(formatted_lines))
+
+    return "\n\n".join(page_texts)
+
+
+def run_ocrmypdf(input_file: Path, output_file: Path) -> None:
+    """OCRmyPDF を実行して、文字レイヤー付きPDFを生成する。"""
+    if shutil.which("ocrmypdf") is None:
+        raise RuntimeError(
+            "文字レイヤーのないPDFを検出しましたが、`ocrmypdf` が見つかりません。"
+            " macOS では `brew install ocrmypdf tesseract tesseract-lang` を実行してください。"
+        )
+
+    command = [
+        "ocrmypdf",
+        "--force-ocr",
+        "--skip-big",
+        "50",
+        "--language",
+        OCR_LANGUAGES,
+        str(input_file),
+        str(output_file),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        error_message = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "OCRmyPDF の実行に失敗しました。"
+            f" コマンド: {' '.join(command)}"
+            f"\n詳細: {error_message or '不明なエラー'}"
+        )
+
+
 def _is_probable_vertical_text_block(lines: list[str]) -> bool:
     """1文字ごとに改行された縦書き抽出結果らしいブロックか判定する。"""
     stripped_lines = [line.strip() for line in lines if line.strip()]
@@ -271,6 +489,7 @@ def convert_file_to_markdown(
     output_dir: str = DEFAULT_OUTPUT_DIR,
     output_file: str | None = None,
     join_vertical_lines: bool = False,
+    ocr_engine: str = "auto",
 ) -> None:
     """
     PDF、Excel、WordなどのローカルファイルをMarkdownに変換する。
@@ -281,15 +500,39 @@ def convert_file_to_markdown(
         raise FileNotFoundError(f"入力ファイルが見つかりません: {input_file}")
 
     text_content = ""
-    if join_vertical_lines and input_file.suffix.lower() == ".pdf":
-        text_content = extract_vertical_pdf_text(input_file)
+    source_file = input_file
+    ocr_temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
-    if not text_content:
-        md = MarkItDown()
-        result = md.convert(str(input_file))
-        text_content = result.text_content
-        if join_vertical_lines:
-            text_content = join_vertical_text_lines(text_content)
+    try:
+        if input_file.suffix.lower() == ".pdf":
+            char_count = count_pdf_text_chars(input_file)
+            if ocr_engine == "paddleocr":
+                print("PaddleOCR を使ってPDF画像をOCRします...")
+                text_content = extract_paddleocr_pdf_text(
+                    input_file,
+                    join_vertical_lines=join_vertical_lines,
+                )
+            elif char_count == 0:
+                print("文字レイヤーのないPDFを検出したため、OCRを実行します...")
+                if ocr_engine == "ocrmypdf" or ocr_engine == "auto":
+                    ocr_temp_dir = tempfile.TemporaryDirectory(prefix="markitdown-ocr-")
+                    source_file = Path(ocr_temp_dir.name) / f"{input_file.stem}.ocr.pdf"
+                    run_ocrmypdf(input_file, source_file)
+                else:
+                    raise ValueError(f"未対応の OCR エンジンです: {ocr_engine}")
+
+        if not text_content and join_vertical_lines and source_file.suffix.lower() == ".pdf":
+            text_content = extract_vertical_pdf_text(source_file)
+
+        if not text_content:
+            md = MarkItDown()
+            result = md.convert(str(source_file))
+            text_content = result.text_content
+            if join_vertical_lines:
+                text_content = join_vertical_text_lines(text_content)
+    finally:
+        if ocr_temp_dir is not None:
+            ocr_temp_dir.cleanup()
 
     base_name = input_file.stem
     output_path = build_output_path(
@@ -437,6 +680,12 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="縦書きPDFの列順を右から左へ整え、1文字ごとに改行された本文も段落単位で連結",
     )
+    parser_file.add_argument(
+        "--ocr-engine",
+        choices=["auto", "ocrmypdf", "paddleocr"],
+        default="auto",
+        help="文字レイヤーのないPDFに使うOCR方式。`paddleocr` を選ぶとPDF全体をPaddleOCRで処理",
+    )
 
     # youtube モード
     parser_youtube = subparsers.add_parser(
@@ -473,6 +722,7 @@ def main() -> None:
             output_dir=args.output_dir,
             output_file=args.output_file,
             join_vertical_lines=args.join_vertical_lines,
+            ocr_engine=args.ocr_engine,
         )
         return
 
