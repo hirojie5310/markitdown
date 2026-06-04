@@ -22,6 +22,32 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+`requirements.txt` では PDF 変換に必要な追加依存を含めるため、
+`markitdown[pdf]` をインストールします。
+
+macOS では `markitdown` の現行版が Python 3.10 以上を必要とするため、
+`python3.11` で仮想環境を作成するのを推奨します。
+
+```bash
+brew install ocrmypdf tesseract tesseract-lang
+/opt/homebrew/bin/python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+画像PDFに対して `PaddleOCR` を比較したい場合は、追加で以下を実行します。
+初回実行時には OCR モデルが `.paddlex_cache/` にダウンロードされます。
+
+```bash
+pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+pip install paddleocr
+```
+
+VS Code / Pylance を使う場合は、Python インタプリタに
+`/Users/hirotaka/markitdown/.venv/bin/python` を選択してください。
+このリポジトリでは [`.vscode/settings.json`](/Users/hirotaka/markitdown/.vscode/settings.json:1) で
+`.venv` を参照する設定を入れています。
+
 ### 使い方
 
 ```bash
@@ -37,13 +63,21 @@ PDFでは PyMuPDF の OCR / block / line / `wmode` 情報を使って、
 さらに近接する縦書き候補ブロックは縦帯としてまとめ、`jpn_vert` や回転 `jpn`
 で再OCRして、より良い候補を採用します。
 埋め込みテキストがない画像PDFでは、300 / 450 / 600 DPI の OCR 結果を比較して
-より良さそうな候補を採用します。PyMuPDF が使えない場合は、空行で区切られた
+より良さそうな候補を採用します。文字レイヤーのない画像PDFを検出した
+場合は、macOS では `ocrmypdf` と `tesseract` を使って自動で OCR を実行します。
+PyMuPDF が使えない場合は、空行で区切られた
 段落単位で本文を連結します。
 
 ```bash
 python main.py file <入力PDFパス> --join-vertical-lines
 python main.py file <入力PDFパス> --force-ocr --ocr-report
 python main.py file <入力PDFパス> --auto-force-ocr --ocr-report
+```
+
+`PaddleOCR` と比較したい場合は、`--ocr-engine paddleocr` を指定できます。
+
+```bash
+python main.py file <入力PDFパス> --join-vertical-lines --ocr-engine paddleocr
 ```
 
 ---
