@@ -31,11 +31,19 @@ python main.py youtube <YouTube URL>
 
 縦書きの書籍をスキャンしたPDFなどで、OCR結果が1文字ごとに改行されたり、
 本文の列順が崩れたりする場合は、`--join-vertical-lines` を付けます。
-PDFでは文字座標を使って縦書き列を右から左へ並べ替え、座標抽出が使えない場合は
-空行で区切られた段落単位で本文を連結します。
+PDFでは PyMuPDF の OCR / block / line / `wmode` 情報を使って、
+縦書き列は右から左、横書き行は上から下へ並べ替えます。OCR が縦書きを
+短い横書き行の束として返した場合は、縦書き列として再連結する補正も行います。
+さらに近接する縦書き候補ブロックは縦帯としてまとめ、`jpn_vert` や回転 `jpn`
+で再OCRして、より良い候補を採用します。
+埋め込みテキストがない画像PDFでは、300 / 450 / 600 DPI の OCR 結果を比較して
+より良さそうな候補を採用します。PyMuPDF が使えない場合は、空行で区切られた
+段落単位で本文を連結します。
 
 ```bash
 python main.py file <入力PDFパス> --join-vertical-lines
+python main.py file <入力PDFパス> --force-ocr --ocr-report
+python main.py file <入力PDFパス> --auto-force-ocr --ocr-report
 ```
 
 ---
